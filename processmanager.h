@@ -93,6 +93,17 @@ public:
     void stop(int killTimeoutMs = 3000);
 
     /**
+     * @brief 同步终止进程并等待结束
+     *
+     * 先调用 terminate()，等待 waitForFinishedMs 毫秒；
+     * 若未退出则调用 killProcessTree() 强制终止整个进程树。
+     * 该方法会阻塞直到进程完全退出，适用于程序退出前的清理。
+     *
+     * @param waitForFinishedMs 等待优雅退出的超时时间（毫秒），默认 3000ms
+     */
+    void stopAndWait(int waitForFinishedMs = 3000);
+
+    /**
      * @brief 检查进程是否正在运行
      *
      * @return true 表示进程正在运行；false 表示未运行或已退出

@@ -1,6 +1,7 @@
 #include "processmanager.h"
 #include <QDebug>
 #include <QRegularExpression>
+#include <QFileInfo>
 
 /**
  * @brief 构造函数，创建 QProcess 并连接内部信号
@@ -23,18 +24,29 @@ ProcessManager::ProcessManager(QObject *parent)
         emit finished(exitCode, exitStatus);
     });
 
-    connect(m_process, &QProcess::readyReadStandardOutput, this, [this]() {
-        QString text = QString::fromLocal8Bit(m_process->readAllStandardOutput());
+    // 解码辅助 lambda：优先 UTF-8，失败则回退本地编码（GBK）
+    auto decodeOutput = [](const QByteArray &data) -> QString {
+        if (data.isEmpty()) return {};
+        QString utf8 = QString::fromUtf8(data);
+        if (!utf8.contains(QChar::ReplacementCharacter))
+            return utf8;
+        return QString::fromLocal8Bit(data);
+    };
+
+    connect(m_process, &QProcess::readyReadStandardOutput, this, [this, decodeOutput]() {
+        QString text = decodeOutput(m_process->readAllStandardOutput());
         const QStringList lines = text.split(QRegularExpression("[\r\n]+"), Qt::SkipEmptyParts);
         for (const QString &line : lines) {
+            qDebug() << "[ProcessManager][stdout]" << line;
             emit outputReceived(line);
         }
     });
 
-    connect(m_process, &QProcess::readyReadStandardError, this, [this]() {
-        QString text = QString::fromLocal8Bit(m_process->readAllStandardError());
+    connect(m_process, &QProcess::readyReadStandardError, this, [this, decodeOutput]() {
+        QString text = decodeOutput(m_process->readAllStandardError());
         const QStringList lines = text.split(QRegularExpression("[\r\n]+"), Qt::SkipEmptyParts);
         for (const QString &line : lines) {
+            qWarning() << "[ProcessManager][stderr]" << line;
             emit errorReceived(line);
         }
     });
@@ -147,6 +159,26 @@ void ProcessManager::stop(int killTimeoutMs)
 }
 
 /**
+ * @brief 同步终止进程并等待结束
+ */
+void ProcessManager::stopAndWait(int waitForFinishedMs)
+{
+    if (!isRunning()) {
+        return;
+    }
+
+    qDebug() << "[ProcessManager] 同步终止进程 (等待" << waitForFinishedMs << "ms)";
+    m_killTimer->stop();
+    m_process->terminate();
+
+    if (!m_process->waitForFinished(waitForFinishedMs)) {
+        qWarning() << "[ProcessManager] terminate 超时，强制 kill 进程树";
+        killProcessTree();
+    }
+    qDebug() << "[ProcessManager] 进程已完全退出";
+}
+
+/**
  * @brief 检查进程是否正在运行
  */
 bool ProcessManager::isRunning() const
@@ -157,16 +189,36 @@ bool ProcessManager::isRunning() const
 /**
  * @brief 终止整个进程树（包含子进程）
  *
- * 使用 taskkill /T /F /PID 终止进程及其所有子进程，
+ * 使用 taskkill /T /F /PID 同步终止进程及其所有子进程，
  * 避免通过 cmd.exe 启动的子进程成为孤儿进程。
  */
 void ProcessManager::killProcessTree()
 {
     qint64 pid = m_process->processId();
+    qDebug() << "[ProcessManager] killProcessTree PID:" << pid
+             << "state:" << m_process->state();
+
     if (pid != 0) {
-        qDebug() << "[ProcessManager] taskkill 进程树 PID:" << pid;
-        QProcess::startDetached("taskkill",
+        // 同步执行 taskkill /T /F，等待命令完成确保整个进程树被终止
+        qDebug() << "[ProcessManager] taskkill /T /F /PID" << pid;
+        int ret = QProcess::execute("taskkill",
             QStringList() << "/T" << "/F" << "/PID" << QString::number(pid));
+        qDebug() << "[ProcessManager] taskkill 返回:" << ret;
     }
+
+    // 终止主进程并同步 QProcess 内部状态
     m_process->kill();
+    m_process->waitForFinished(2000);
+
+    // 兑底：若进程仍在运行，按程序名强制终止
+    if (m_process->state() != QProcess::NotRunning) {
+        QString prog = m_program.isEmpty() ? m_process->program() : m_program;
+        if (!prog.isEmpty()) {
+            QString procName = QFileInfo(prog).fileName();
+            qWarning() << "[ProcessManager] 进程仍在运行，兜底 taskkill /IM" << procName;
+            QProcess::execute("taskkill",
+                QStringList() << "/F" << "/IM" << procName);
+            m_process->waitForFinished(2000);
+        }
+    }
 }
